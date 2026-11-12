@@ -101,29 +101,45 @@ class LaunchTests(unittest.TestCase):
             run.managed_environment()
         execute.assert_not_called()
 
-    def test_setup_snapshots_existing_environment_before_package_install(self):
-        events = []
-        def shell(command, **kwargs):
-            if command[:3] == ["git", "rev-parse", "HEAD"]:
-                return NS(stdout=run.SOURCES["lerobot"])
-            if command[-1] == "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')":
-                return NS(stdout="3.12\n")
-            if "install" in command:
-                events.append("install")
-            self.assertNotIn("create", command)
-            return NS(stdout="")
+    def test_setup_preserves_existing_packages_and_source_without_installing(self):
+        with patch.object(run, "conda_prefix", return_value=Path("/tmp/envs/lerobot")), \
+             patch.object(run, "conda_executable", return_value="conda"), \
+             patch.object(run, "record_environment") as record, \
+             patch.object(run, "shell") as shell, \
+             patch.object(run.subprocess, "run") as process:
+            run.setup()
+        record.assert_called_once_with("lerobot", Path("/tmp/envs/lerobot"), "preserved")
+        shell.assert_not_called()
+        process.assert_not_called()
+
+    def test_missing_environment_installs_reconstruction(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(run, "LEROBOT", Path(directory)), \
-             patch.object(run, "conda_prefix", return_value=Path("/tmp/envs/lerobot")), \
+             patch.object(run, "conda_prefix", side_effect=[None, Path("/tmp/envs/lerobot")]), \
              patch.object(run, "conda_executable", return_value="conda"), \
              patch.object(run.shutil, "which", return_value="git"), \
-             patch.object(run, "shell", side_effect=shell), \
+             patch.object(run, "shell", return_value=NS(stdout=run.SOURCES["lerobot"])) as shell, \
              patch.object(run.subprocess, "run", return_value=NS(returncode=0)), \
-             patch.object(run, "snapshot_environment", side_effect=lambda *args: events.append("snapshot")):
+             patch.object(run, "record_environment") as record:
             run.setup()
-            runtime = json.loads((Path(directory) / "baseline-runtime.json").read_text())
-        self.assertEqual(events, ["snapshot", "install", "snapshot"])
-        self.assertEqual(runtime["name"], "lerobot")
+        commands = [call.args[0] for call in shell.call_args_list]
+        self.assertTrue(any("create" in cmd for cmd in commands))
+        self.assertTrue(any("install" in cmd for cmd in commands))
+        record.assert_called_once_with("lerobot", Path("/tmp/envs/lerobot"), "reconstructed")
+
+    def test_preserved_environment_keeps_existing_checkpoints_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base, model = Path(directory) / "upstream", Path(directory) / "prepared"
+            for folder in (base, model):
+                folder.mkdir()
+                (folder / "config.json").write_text('{"original": true}')
+                (folder / "model.safetensors").touch()
+            with patch.object(run, "BASE", base), patch.object(run, "MODEL", model), \
+                 patch.object(run, "saved_runtime", return_value={"kind": "preserved"}), \
+                 patch.object(run, "migrate") as migrate:
+                run.prepare(NS(env_name="lerobot"))
+            migrate.assert_not_called()
+            self.assertEqual((model / "config.json").read_text(), '{"original": true}')
 
     def test_migration_preserves_joint_transform(self):
         source = dict(joint_signs=[1, -1, 1, 1, 1, 1], joint_offsets=[0, 90, 90, 0, 0, 0],
@@ -175,12 +191,62 @@ class WaypointTests(unittest.TestCase):
 
 
 class HandoffTests(unittest.TestCase):
+    def test_primitive_targets_and_pauses_match_historical_commit(self):
+        """Compare against the actual old code, including a robot that misses targets."""
+        source = subprocess.check_output(
+            ["git", "show", "9cb398d:scripts/commit_session.py"], cwd=BASELINE.parent, text=True)
+        original = types.ModuleType("original_commit_session")
+        exec(compile(source, "9cb398d:scripts/commit_session.py", "exec"), original.__dict__)
+
+        class LaggingRobot(FakeRobot):
+            reads = 0
+
+            def get_observation(self):
+                self.reads += 1
+                return {k: -2.0 for k in waypoints.JOINTS}
+
+        old_robot, new_robot = LaggingRobot(), LaggingRobot()
+        old_ctx = NS(hardware=NS(robot_wrapper=old_robot))
+        old_ctrl = NS(stopped=False, start=lambda: True, _running=threading.Event(),
+                      _start_requested=threading.Event(), _segment_stop=threading.Event(), _wake=threading.Event())
+        old_session = NS(controller=old_ctrl, _ctx=old_ctx, _print=lambda message: None)
+        path = BASELINE / "reference_waypoints/tape_grasp.json"
+        old_pauses, new_pauses = [], []
+        env = dict(COMMIT_GRASP=str(path), COMMIT_CLOSED="0", COMMIT_DIVE_STEP_DEG="0.4", COMMIT_DIVE_FPS="15")
+        with patch.dict(os.environ, env), patch.object(original.time, "sleep", side_effect=old_pauses.append):
+            original._run_commit(old_session, want_reset=False, seconds=0, record=False)
+        hybrid, _, ctx, _ = hybrid_fixture()
+        ctx.hardware.robot_wrapper = new_robot
+        hybrid.pending = (15, False, False, waypoints.commit_sequence(path))
+
+        def wait(seconds, observe=False):
+            if seconds:
+                new_pauses.append(seconds)
+
+        with patch.object(hybrid, "wait", side_effect=wait), \
+             patch.object(session.time, "sleep", side_effect=new_pauses.append):
+            hybrid.run(ctx)
+        self.assertEqual(new_robot.sent, old_robot.sent)
+        self.assertEqual(new_pauses, old_pauses)
+        self.assertEqual(old_robot.reads, 1)
+        self.assertEqual(new_robot.reads, 1)
+
+    def test_original_move_rounds_step_count_down(self):
+        robot = FakeRobot()
+        start = {k: 0.0 for k in waypoints.JOINTS}
+        goal = {k: 1.01 for k in waypoints.JOINTS}
+        with patch.object(session.time, "sleep"):
+            result = session.move(robot, start, goal, step_deg=0.4, fps=15)
+        self.assertEqual(len(robot.sent), 2)  # Same floor rounding as historical _move.
+        self.assertEqual(result, goal)
+
     def test_policy_returns_and_pauses_before_primitive_then_resets(self):
         hybrid, robot, ctx, events = hybrid_fixture()
         hybrid.request(NS(args="20 reset"))
         def move(*args, **kwargs):
             self.assertEqual(events[:2], [("policy_return", 20), "paused"])
             events.append("primitive")
+            return dict(args[2])
         with patch.object(session, "move", side_effect=move), patch.object(hybrid, "wait"):
             hybrid.run(ctx)
         self.assertEqual(events[-1], "reset")
@@ -202,6 +268,7 @@ class HandoffTests(unittest.TestCase):
         def move(*args, **kwargs):
             if hybrid.trace.phase == "clamp":
                 hybrid.controller._stop_requested.set()
+            return dict(args[2])
         with patch.object(session, "move", side_effect=move) as motion:
             hybrid.run(ctx)
         self.assertEqual(motion.call_count, 2)
@@ -282,6 +349,7 @@ class HandoffTests(unittest.TestCase):
                     self.assertIn("paused", events)
                     self.assertEqual(events[0][1], threading.get_ident())
                     events.append("primitive")
+                    return dict(args[2])
 
                 with patch.object(session, "move", side_effect=primitive), patch.object(hybrid, "wait"):
                     controller.serve()

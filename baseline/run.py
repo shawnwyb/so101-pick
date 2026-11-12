@@ -19,6 +19,7 @@ ROOT = HERE.parent
 SOURCES = json.loads((HERE / "sources.json").read_text())
 LEROBOT = ROOT / "lerobot"
 REQUIREMENTS = HERE / "requirements-lock.txt"
+RUNTIMES = ROOT / ".cache/baseline-environments"
 BASE = ROOT / "models/molmoact2-upstream"
 MODEL = ROOT / "models/molmoact2-mps"
 GRASP = ROOT / "outputs/waypoints/grasp.json"
@@ -63,8 +64,37 @@ def snapshot_environment(directory, name):
         (directory / filename).write_text(shell(command, capture=True).stdout)
 
 
+def runtime_path(name):
+    return RUNTIMES / f"{name}.json"
+
+
+def record_environment(name, prefix, kind):
+    directory = ROOT / "outputs/environments" / (name + "-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+    snapshot_environment(directory, name)
+    probe = ("import sys,platform,importlib.util,json; s=importlib.util.find_spec('lerobot'); "
+             "print(json.dumps(dict(python=sys.version,platform=platform.platform(),"
+             "lerobot_file=s.origin if s else None)))")
+    installed = json.loads(shell(conda_command(name, "python", "-c", probe), capture=True).stdout)
+    if installed["lerobot_file"]:
+        source = Path(installed["lerobot_file"]).parent
+        revision = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
+                                  text=True, capture_output=True)
+        if revision.returncode == 0:
+            installed["lerobot_git_commit"] = revision.stdout.strip()
+            diff = shell(["git", "diff", "--binary", "HEAD"], cwd=source, capture=True).stdout
+            (directory / "lerobot-local-changes.patch").write_text(diff)
+    (directory / "installed-runtime.json").write_text(json.dumps(installed, indent=2) + "\n")
+    runtime = dict(name=name, prefix=str(prefix), kind=kind, snapshot=str(directory), installed=installed)
+    if kind == "reconstructed":
+        runtime["requirements_sha256"] = hashlib.sha256(REQUIREMENTS.read_bytes()).hexdigest()
+    RUNTIMES.mkdir(parents=True, exist_ok=True)
+    runtime_path(name).write_text(json.dumps(runtime, indent=2) + "\n")
+    print(f"Saved environment: {directory}")
+    return runtime
+
+
 def setup(dry_run=False, env_name="lerobot"):
-    """Create/reuse the original named Conda environment and install pinned code."""
+    """Preserve an existing Conda environment; reconstruct dependencies only if missing."""
     conda = "conda" if dry_run else conda_executable()
     create = [conda, "create", "--yes", "--name", env_name, "--override-channels",
               "--channel", "conda-forge", f"python={SOURCES['python']}", "pip", "ffmpeg"]
@@ -80,27 +110,23 @@ def setup(dry_run=False, env_name="lerobot"):
     if sys.platform == "linux":
         install += ["--extra-index-url", "https://download.pytorch.org/whl/cu128"]
     if dry_run:
-        print("Create if missing; existing Python 3.12 environments are reused:")
+        print("If the environment exists: export it and use installed packages unchanged; no install or source patch.")
+        print("Only if missing, reconstruct an environment with:")
         print(shlex.join(map(str, create)))
         for command in commands:
             print(shlex.join(map(str, command)))
         print("Apply baseline/patches/lerobot-mps-loader.patch if not already applied")
-        print("Snapshot an existing Conda environment before installing reconstructed dependency pins")
         print(shlex.join(map(str, install)))
+        return
+    prefix = conda_prefix(env_name, required=False)
+    if prefix is not None:
+        record_environment(env_name, prefix, "preserved")
+        print(f"Using existing Conda environment {env_name!r}; packages, Python and LeRobot source unchanged.")
         return
     if not shutil.which("git"):
         raise ValueError("Install Git first (macOS: brew install git), then retry.")
-    prefix = conda_prefix(env_name, required=False)
-    existing = prefix is not None
-    if prefix is None:
-        shell(create)
-        prefix = conda_prefix(env_name)
-    version = shell(conda_command(env_name, "python", "-c",
-                                 "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"),
-                    capture=True).stdout.strip()
-    if version != "3.12":
-        raise ValueError(f"Conda environment {env_name!r} uses Python {version}; this reconstruction needs 3.12. "
-                         "Use --env-name lerobot-baseline to create a separate environment.")
+    shell(create)
+    prefix = conda_prefix(env_name)
     if not LEROBOT.exists():
         for command in commands:
             shell(command)
@@ -113,16 +139,8 @@ def setup(dry_run=False, env_name="lerobot"):
     if reverse.returncode:
         shell(["git", "apply", "--check", patch], cwd=LEROBOT)
         shell(["git", "apply", patch], cwd=LEROBOT)
-    if existing:
-        backup = ROOT / "outputs/environment-backups" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        snapshot_environment(backup, env_name)
-        print(f"Saved existing Conda environment details: {backup}")
     shell(install)
-    snapshot_environment(LEROBOT, env_name)
-    (LEROBOT / "baseline-runtime.json").write_text(json.dumps({
-        "name": env_name, "prefix": str(prefix),
-        "requirements_sha256": hashlib.sha256(REQUIREMENTS.read_bytes()).hexdigest(),
-    }, indent=2) + "\n")
+    record_environment(env_name, prefix, "reconstructed")
     print(f"Setup complete. Runtime: Conda environment {env_name!r}. Activate with: conda activate {env_name}")
 
 
@@ -131,6 +149,13 @@ def managed_environment(env_name="lerobot"):
     if Path(sys.prefix).resolve() != prefix.resolve() or os.environ.get("CONDA_PREFIX") != str(prefix):
         command = list(map(str, conda_command(env_name, "python", HERE / "run.py", *sys.argv[1:])))
         os.execv(command[0], command)
+
+
+def saved_runtime(name):
+    path = runtime_path(name)
+    if not path.exists():
+        raise ValueError("Run setup first to record the Conda environment; existing packages will be preserved.")
+    return json.loads(path.read_text())
 
 
 def migrate(config, device="mps", dtype="bfloat16"):
@@ -147,6 +172,12 @@ def migrate(config, device="mps", dtype="bfloat16"):
 
 
 def prepare(args):
+    runtime = saved_runtime(args.env_name)
+    if runtime["kind"] == "preserved" and all(
+            (directory / "config.json").exists() and list(directory.glob("*.safetensors"))
+            for directory in (BASE, MODEL)):
+        print("Using existing local checkpoints and processors unchanged.")
+        return
     from huggingface_hub import snapshot_download
     import draccus
     from lerobot.policies.molmoact2.configuration_molmoact2 import MolmoAct2Config
@@ -277,14 +308,14 @@ def check(args):
     from lerobot.scripts.lerobot_rollout import main as rollout_main
     from waypoints import load
 
-    actual = shell(["git", "rev-parse", "HEAD"], cwd=LEROBOT, capture=True).stdout.strip()
-    if actual != SOURCES["lerobot"]:
-        raise ValueError("LeRobot checkout differs from sources.json; rerun setup with a clean checkout.")
-    runtime = json.loads((LEROBOT / "baseline-runtime.json").read_text())
-    if (runtime["name"] != args.env_name
-            or Path(runtime["prefix"]).resolve() != Path(sys.prefix).resolve()
-            or runtime["requirements_sha256"] != hashlib.sha256(REQUIREMENTS.read_bytes()).hexdigest()):
-        raise ValueError("Conda environment or dependency pins differ from setup; rerun setup with this --env-name.")
+    runtime = saved_runtime(args.env_name)
+    if Path(runtime["prefix"]).resolve() != Path(sys.prefix).resolve():
+        raise ValueError("Conda environment differs from setup; rerun setup with this --env-name.")
+    if runtime["kind"] == "reconstructed":
+        actual = shell(["git", "rev-parse", "HEAD"], cwd=LEROBOT, capture=True).stdout.strip()
+        if (actual != SOURCES["lerobot"] or runtime["requirements_sha256"]
+                != hashlib.sha256(REQUIREMENTS.read_bytes()).hexdigest()):
+            raise ValueError("Reconstruction source/dependency pins differ from the recorded setup.")
 
     if args.device == "mps" and not torch.backends.mps.is_available():
         raise ValueError("MPS unavailable. The original experiment used an Apple Silicon Mac.")
@@ -295,7 +326,8 @@ def check(args):
     for directory in (MODEL, BASE):
         if not (directory / "config.json").exists() or not list(directory.glob("*.safetensors")):
             raise ValueError(f"Incomplete checkpoint {directory}; run `prepare`.")
-    if json.loads((MODEL / "source_revisions.json").read_text()) != SOURCES:
+    if (runtime["kind"] == "reconstructed"
+            and json.loads((MODEL / "source_revisions.json").read_text()) != SOURCES):
         raise ValueError("Checkpoint pins differ; run `prepare`.")
     config = json.loads((MODEL / "config.json").read_text())
     if config["device"] != args.device or config["dtype"] != args.dtype:
@@ -328,7 +360,9 @@ def run(args):
 
     directory = ROOT / "outputs/runs" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     directory.mkdir(parents=True)
-    manifest = dict(sources=SOURCES, options={k: str(v) if isinstance(v, Path) else v
+    runtime = saved_runtime(args.env_name)
+    manifest = dict(reconstruction_pins=SOURCES, runtime=runtime,
+                    options={k: str(v) if isinstance(v, Path) else v
                                             for k, v in vars(args).items()}, argv=command,
                     python=sys.version, platform=platform.platform(),
                     conda_environment=args.env_name, conda_prefix=sys.prefix)
@@ -344,9 +378,7 @@ def run(args):
     shutil.copy2(MODEL / "config.json", directory / "model_config.json")
     shutil.copy2(MODEL / "policy_preprocessor.json", directory / "policy_preprocessor.json")
     shutil.copytree(HERE, directory / "source", ignore=shutil.ignore_patterns("__pycache__", "assets", "tests"))
-    shutil.copy2(LEROBOT / "baseline-environment.txt", directory / "environment.txt")
-    shutil.copy2(LEROBOT / "baseline-environment.yml", directory / "environment.yml")
-    shutil.copy2(LEROBOT / "baseline-conda-explicit.txt", directory / "conda-explicit.txt")
+    shutil.copytree(runtime["snapshot"], directory / "environment")
     restore = install(InteractiveSession, args, directory)
     previous = sys.argv
     try:
@@ -363,9 +395,9 @@ def wizard(args):
         raise ValueError("The original MPS experiment needs an Apple Silicon Mac. "
                          "This host cannot run that backend. See baseline/README.md; "
                          "CUDA/CPU adaptations require an explicit --device selection.")
-    runtime_file = LEROBOT / "baseline-runtime.json"
+    runtime_file = runtime_path(args.env_name)
     if not runtime_file.exists() or json.loads(runtime_file.read_text())["name"] != args.env_name:
-        print("Step 1: install the pinned environment (model weights are downloaded separately).")
+        print("Step 1: preserve the existing Conda environment, or install a reconstruction if missing.")
         setup(env_name=args.env_name)
     managed_environment(args.env_name)
     print("Original experiment: Apple Silicon/MPS, calibrated SO-101, top + wrist cameras.")
@@ -378,7 +410,7 @@ def wizard(args):
         raise ValueError("Camera indices must differ")
     if input("Is this arm already calibrated under that ID? [y/N]: ").lower() != "y":
         calibrate(args)
-    print("Step 2: download pinned model weights and prepare the MPS checkpoint.")
+    print("Step 2: reuse existing checkpoints, or download/prepare them if missing.")
     prepare(args)
     print("Step 3: verify camera assignment in the browser, then Enter to finish.")
     cameras(args)

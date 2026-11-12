@@ -6,7 +6,23 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-from waypoints import JOINTS, commit_sequence, move
+from waypoints import JOINTS, commit_sequence, read_joints
+
+
+def move(robot, start, goal, step_deg=1.5, fps=30.0, cancelled=lambda: False, observe=False):
+    """Original commit_session._move arithmetic; optional cancellation/recording hooks."""
+    dist = max(abs(goal[k] - start[k]) for k in start)
+    steps = max(1, int(dist / step_deg))
+    dt = 1.0 / fps
+    keys = [k for k in goal if not k.startswith("_")]
+    for i in range(1, steps + 1):
+        if observe:
+            robot.get_observation()
+        if cancelled():
+            raise InterruptedError("Commit cancelled")
+        robot.send_action({k: start[k] + (goal[k] - start[k]) * i / steps for k in keys})
+        time.sleep(dt)
+    return {k: goal[k] for k in keys}
 
 
 class Trace:
@@ -178,12 +194,14 @@ class HybridStrategy:
             ctx.policy.inference.pause()
             if self.cancelled():
                 raise InterruptedError("Commit cancelled before handoff")
+            self.wait(0.3, record)  # Original post-policy settling pause.
+            current = read_joints(robot)  # Original: measure once, then chain targets.
             self.say("Policy stopped; taught grasp taking over.")
             for stage, waypoint in zip(("lower", "clamp", "lift"), sequence, strict=True):
                 self.trace.phase = stage
                 self.say(f"{stage}: {waypoint['name']}")
-                move(robot, waypoint["joints"],
-                     step=1.5 if stage == "clamp" else self.options.dive_step,
+                current = move(robot, current, waypoint["joints"],
+                     step_deg=1.5 if stage == "clamp" else self.options.dive_step,
                      fps=30 if stage == "clamp" else self.options.dive_fps,
                      cancelled=self.cancelled, observe=record)
                 if stage == "clamp":
@@ -192,12 +210,15 @@ class HybridStrategy:
                         raise InterruptedError("Commit cancelled")
                     robot.send_action(waypoint["joints"])
                     self.wait(3, record)
-                    move(robot, waypoint["joints"], step=0.4, fps=15,
+                    current = move(robot, current, waypoint["joints"], step_deg=0.4, fps=15,
                          cancelled=self.cancelled, observe=record)
                     self.wait(1, record)
                 else:
                     self.wait(0.8, record)
             self.trace.phase = "hold"
+            if self.cancelled():
+                raise InterruptedError("Commit cancelled")
+            robot.send_action(current)
             self.wait(5 if record else 0, record)
             if reset:
                 self.controller.reset()

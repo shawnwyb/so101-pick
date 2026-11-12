@@ -29,7 +29,7 @@ def validate_pose(pose):
 
 def read_joints(robot):
     observation = robot.get_observation()
-    return validate_pose({key: observation[key] for key in JOINTS})
+    return validate_pose({key: float(observation[key]) for key in JOINTS})
 
 
 def move(robot, goal, step=0.4, fps=15.0, cancelled=lambda: False, observe=False):

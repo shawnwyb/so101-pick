@@ -20,7 +20,7 @@ Prerequisites:
 
 **Support the arm during teaching and disconnection: torque releases.**
 
-From the repository root:
+From the repository root, reuse `lerobot` if it exists or create it if missing:
 
 ```bash
 python3 baseline/run.py setup
@@ -30,21 +30,24 @@ python baseline/run.py
 
 | Command | What it does automatically |
 |---|---|
-| `setup` | Creates Conda env `lerobot` if missing; installs pinned Python dependencies, the LeRobot checkout and MPS patch. New environments include Python 3.12.12, pip and FFmpeg. |
-| No command (the guide) | Runs setup if needed; asks for connection details, offers calibration, downloads/prepares weights, previews cameras, teaches poses, then asks before opening the model session. |
+| `setup` | Uses an existing Conda environment unchanged. If missing, installs the pinned dependencies, LeRobot and MPS patch in a new environment. |
+| No command (the guide) | Runs setup if needed; asks for connection details, offers calibration, reuses local weights or prepares missing ones, previews cameras, teaches poses, then asks before opening the model session. |
 | `run --port ...` | Uses the Conda environment, runs preflight, loads the prepared model and connects. Run setup/prepare first; it does not reinstall dependencies or download weights. |
 
-An existing environment must use Python 3.12 and have pip/FFmpeg available.
-Setup exports its specifications before updating Python packages. To use a
-separate environment, add `--env-name lerobot-baseline` to setup and later commands.
-The launcher uses `conda run` if the selected environment is inactive.
+The original environment is optional. The launcher uses `conda run` if the selected
+environment is inactive.
+
+For a separate fresh installation, add `--env-name lerobot-baseline` to setup and
+later commands. New environments include Python 3.12.12, pip and FFmpeg. Setup
+leaves existing environments unchanged, including incomplete ones; use an unused
+name if you need dependencies installed from scratch.
 
 ### Run individual steps
 
-After setup, with `lerobot` activated:
+After setup, with the selected environment activated (default: `lerobot`):
 
 ```bash
-# Download and prepare model weights.
+# Reuse existing local weights; download/prepare them if missing.
 python baseline/run.py prepare
 
 # Find the port; replace YOUR_PORT below. Skip calibration if already done.
@@ -93,6 +96,10 @@ Default `sync` mode executes 30 actions per observation; `--mode replan` execute
 the clamp/lift gripper target to `0`; override with `--closed-gripper`. Replay
 uses taught targets unchanged. See `--help` for other options.
 
+Commit motion comes from the original `commit_session.py`: measure joints once at
+handoff, then interpolate from each previous target using the original step counts
+and settling pauses. The session handoff and recording integration remain refactored.
+
 ## Related reports and possible causes
 
 The cause of our repeated up/down motion remains unresolved. These references suggest checks:
@@ -110,8 +117,8 @@ predictions with executed targets; this explanation is unconfirmed.
 
 ## Reproducibility
 
-- **Pins:** [sources.json](sources.json) records model/LeRobot revisions and Python; [requirements-lock.txt](requirements-lock.txt) pins dependencies installed inside Conda. The exact original environment was not recorded.
-- **Saved outputs:** `outputs/runs/<timestamp>/` holds code/config snapshots, environment exports, launch options, action traces and images. `/commitandrecord` adds videos. Environment backups go in `outputs/environment-backups/`.
+- **Dependencies:** the original versions were not fully recorded, so reproducing the setup may require adjustments for dependency differences. [sources.json](sources.json) and [requirements-lock.txt](requirements-lock.txt) describe the fresh reconstruction.
+- **Saved runs:** `outputs/runs/<timestamp>/` holds code/config snapshots, the environment export, launch options, action traces and images. `/commitandrecord` adds videos.
 - **Known limits:** model inference and physical grasping remain unvalidated after this refactor. The handoff has no alignment/contact feedback; CUDA/CPU adaptations are also unvalidated.
 
 Back up models, run outputs and robot calibration files separately from Git.
