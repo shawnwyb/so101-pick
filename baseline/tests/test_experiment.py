@@ -69,7 +69,61 @@ class LaunchTests(unittest.TestCase):
         for argv in (("setup", "--dry-run"), ("run", "--port", "/dev/test", "--dry-run")):
             result = subprocess.run([sys.executable, str(BASELINE / "run.py"), *argv],
                                     capture_output=True, text=True, check=True)
-            self.assertIn("--locked" if argv[0] == "setup" else "Dry run", result.stdout)
+            self.assertIn("--requirement" if argv[0] == "setup" else "Dry run", result.stdout)
+
+    def test_setup_plan_uses_conda_without_venv_or_uv(self):
+        result = subprocess.run([sys.executable, str(BASELINE / "run.py"), "setup", "--dry-run",
+                                 "--env-name", "lerobot-baseline"],
+                                capture_output=True, text=True, check=True)
+        self.assertIn("conda create --yes --name lerobot-baseline", result.stdout)
+        self.assertIn("conda run --no-capture-output --name lerobot-baseline python -m pip install", result.stdout)
+        self.assertIn("requirements-lock.txt", result.stdout)
+        self.assertNotIn("uv sync", result.stdout)
+        self.assertNotIn(".venv", result.stdout)
+
+    def test_inactive_environment_uses_conda_run_and_preserves_arguments(self):
+        prefix = Path("/tmp/conda-envs/lerobot")
+        with patch.object(run, "conda_prefix", return_value=prefix), \
+             patch.object(run, "conda_executable", return_value="/opt/conda/bin/conda"), \
+             patch.object(sys, "argv", ["run.py", "run", "--task", "Pick up the white block."]), \
+             patch.object(run.os, "execv") as execute:
+            run.managed_environment()
+        command = execute.call_args.args[1]
+        self.assertEqual(command[:7], ["/opt/conda/bin/conda", "run", "--no-capture-output",
+                                       "--name", "lerobot", "python", str(BASELINE / "run.py")])
+        self.assertEqual(command[-3:], ["run", "--task", "Pick up the white block."])
+
+    def test_active_environment_is_not_reentered(self):
+        prefix = Path(sys.prefix)
+        with patch.object(run, "conda_prefix", return_value=prefix), \
+             patch.dict(os.environ, {"CONDA_PREFIX": str(prefix)}), \
+             patch.object(run.os, "execv") as execute:
+            run.managed_environment()
+        execute.assert_not_called()
+
+    def test_setup_snapshots_existing_environment_before_package_install(self):
+        events = []
+        def shell(command, **kwargs):
+            if command[:3] == ["git", "rev-parse", "HEAD"]:
+                return NS(stdout=run.SOURCES["lerobot"])
+            if command[-1] == "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')":
+                return NS(stdout="3.12\n")
+            if "install" in command:
+                events.append("install")
+            self.assertNotIn("create", command)
+            return NS(stdout="")
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(run, "LEROBOT", Path(directory)), \
+             patch.object(run, "conda_prefix", return_value=Path("/tmp/envs/lerobot")), \
+             patch.object(run, "conda_executable", return_value="conda"), \
+             patch.object(run.shutil, "which", return_value="git"), \
+             patch.object(run, "shell", side_effect=shell), \
+             patch.object(run.subprocess, "run", return_value=NS(returncode=0)), \
+             patch.object(run, "snapshot_environment", side_effect=lambda *args: events.append("snapshot")):
+            run.setup()
+            runtime = json.loads((Path(directory) / "baseline-runtime.json").read_text())
+        self.assertEqual(events, ["snapshot", "install", "snapshot"])
+        self.assertEqual(runtime["name"], "lerobot")
 
     def test_migration_preserves_joint_transform(self):
         source = dict(joint_signs=[1, -1, 1, 1, 1, 1], joint_offsets=[0, 90, 90, 0, 0, 0],

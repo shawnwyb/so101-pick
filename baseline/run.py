@@ -9,7 +9,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import venv
 from datetime import datetime
 from pathlib import Path
 
@@ -19,9 +18,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 SOURCES = json.loads((HERE / "sources.json").read_text())
 LEROBOT = ROOT / "lerobot"
-PYTHON = LEROBOT / ".venv/bin/python"
-TOOLS = ROOT / ".cache/baseline-tools"
-UV = TOOLS / "bin/uv"
+REQUIREMENTS = HERE / "requirements-lock.txt"
 BASE = ROOT / "models/molmoact2-upstream"
 MODEL = ROOT / "models/molmoact2-mps"
 GRASP = ROOT / "outputs/waypoints/grasp.json"
@@ -33,31 +30,79 @@ def shell(command, cwd=ROOT, capture=False):
                           text=True, capture_output=capture)
 
 
-def setup(dry_run=False):
-    """Install into an isolated, pinned checkout; leave existing environments alone."""
+def conda_executable():
+    executable = os.environ.get("CONDA_EXE") or shutil.which("conda")
+    if not executable:
+        raise ValueError("Install Conda/Miniforge first; see baseline/README.md.")
+    return executable
+
+
+def conda_prefix(name, required=True):
+    result = shell([conda_executable(), "env", "list", "--json"], capture=True)
+    matches = [Path(p) for p in json.loads(result.stdout)["envs"] if Path(p).name == name]
+    if len(matches) > 1:
+        raise ValueError(f"Multiple Conda environments named {name!r}; use a unique --env-name.")
+    if matches:
+        return matches[0]
+    if required:
+        raise ValueError(f"Missing Conda environment {name!r}; run the setup command first.")
+    return None
+
+
+def conda_command(name, *command):
+    return [conda_executable(), "run", "--no-capture-output", "--name", name, *command]
+
+
+def snapshot_environment(directory, name):
+    directory.mkdir(parents=True, exist_ok=True)
+    for filename, command in (
+        ("baseline-environment.txt", conda_command(name, "python", "-m", "pip", "freeze")),
+        ("baseline-environment.yml", [conda_executable(), "env", "export", "--name", name]),
+        ("baseline-conda-explicit.txt", [conda_executable(), "list", "--name", name, "--explicit"]),
+    ):
+        (directory / filename).write_text(shell(command, capture=True).stdout)
+
+
+def setup(dry_run=False, env_name="lerobot"):
+    """Create/reuse the original named Conda environment and install pinned code."""
+    conda = "conda" if dry_run else conda_executable()
+    create = [conda, "create", "--yes", "--name", env_name, "--override-channels",
+              "--channel", "conda-forge", f"python={SOURCES['python']}", "pip", "ffmpeg"]
     commands = [
-        [TOOLS / "bin/python", "-m", "pip", "install", f"uv=={SOURCES['uv']}"],
         ["git", "init", LEROBOT],
         ["git", "-C", LEROBOT, "remote", "add", "origin", "https://github.com/huggingface/lerobot.git"],
         ["git", "-C", LEROBOT, "fetch", "--depth=1", "origin", SOURCES["lerobot"]],
         ["git", "-C", LEROBOT, "checkout", "--detach", "FETCH_HEAD"],
     ]
-    sync = [UV, "sync", "--locked", "--no-default-groups", "--python", SOURCES["python"],
-            "--extra", "molmoact2", "--extra", "feetech", "--extra", "core_scripts"]
+    install = [conda, "run", "--no-capture-output", "--name", env_name,
+               "python", "-m", "pip", "install", "--requirement", REQUIREMENTS,
+               "--editable", f"{LEROBOT}[molmoact2,feetech,core_scripts]"]
+    if sys.platform == "linux":
+        install += ["--extra-index-url", "https://download.pytorch.org/whl/cu128"]
     if dry_run:
-        print(f"Create bootstrap venv: {TOOLS}")
+        print("Create if missing; existing Python 3.12 environments are reused:")
+        print(shlex.join(map(str, create)))
         for command in commands:
             print(shlex.join(map(str, command)))
         print("Apply baseline/patches/lerobot-mps-loader.patch if not already applied")
-        print(shlex.join(map(str, sync)) + f"  # cwd={LEROBOT}")
+        print("Snapshot an existing Conda environment before installing reconstructed dependency pins")
+        print(shlex.join(map(str, install)))
         return
-    if not shutil.which("git") or not shutil.which("ffmpeg"):
-        raise ValueError("Install Git and FFmpeg first (macOS: brew install git ffmpeg), then retry.")
-    if not UV.exists():
-        venv.EnvBuilder(with_pip=True).create(TOOLS)
-        shell(commands[0])
+    if not shutil.which("git"):
+        raise ValueError("Install Git first (macOS: brew install git), then retry.")
+    prefix = conda_prefix(env_name, required=False)
+    existing = prefix is not None
+    if prefix is None:
+        shell(create)
+        prefix = conda_prefix(env_name)
+    version = shell(conda_command(env_name, "python", "-c",
+                                 "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"),
+                    capture=True).stdout.strip()
+    if version != "3.12":
+        raise ValueError(f"Conda environment {env_name!r} uses Python {version}; this reconstruction needs 3.12. "
+                         "Use --env-name lerobot-baseline to create a separate environment.")
     if not LEROBOT.exists():
-        for command in commands[1:]:
+        for command in commands:
             shell(command)
     actual = shell(["git", "rev-parse", "HEAD"], cwd=LEROBOT, capture=True).stdout.strip()
     if actual != SOURCES["lerobot"]:
@@ -68,18 +113,24 @@ def setup(dry_run=False):
     if reverse.returncode:
         shell(["git", "apply", "--check", patch], cwd=LEROBOT)
         shell(["git", "apply", patch], cwd=LEROBOT)
-    shell(sync, cwd=LEROBOT)
-    freeze = shell([UV, "pip", "freeze", "--python", PYTHON], capture=True).stdout
-    (LEROBOT / "baseline-environment.txt").write_text(freeze)
-    print("Setup complete. Python and dependencies are isolated under lerobot/.")
+    if existing:
+        backup = ROOT / "outputs/environment-backups" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        snapshot_environment(backup, env_name)
+        print(f"Saved existing Conda environment details: {backup}")
+    shell(install)
+    snapshot_environment(LEROBOT, env_name)
+    (LEROBOT / "baseline-runtime.json").write_text(json.dumps({
+        "name": env_name, "prefix": str(prefix),
+        "requirements_sha256": hashlib.sha256(REQUIREMENTS.read_bytes()).hexdigest(),
+    }, indent=2) + "\n")
+    print(f"Setup complete. Runtime: Conda environment {env_name!r}. Activate with: conda activate {env_name}")
 
 
-def managed_environment():
-    if not PYTHON.exists():
-        raise ValueError("Run `python3 baseline/run.py setup` first, or run without arguments for the guide.")
-    # Do not resolve symlinks: venv Python may point to the same base interpreter.
-    if Path(sys.prefix) != PYTHON.parent.parent:
-        os.execv(str(PYTHON), [str(PYTHON), str(HERE / "run.py"), *sys.argv[1:]])
+def managed_environment(env_name="lerobot"):
+    prefix = conda_prefix(env_name)
+    if Path(sys.prefix).resolve() != prefix.resolve() or os.environ.get("CONDA_PREFIX") != str(prefix):
+        command = list(map(str, conda_command(env_name, "python", HERE / "run.py", *sys.argv[1:])))
+        os.execv(command[0], command)
 
 
 def migrate(config, device="mps", dtype="bfloat16"):
@@ -229,6 +280,11 @@ def check(args):
     actual = shell(["git", "rev-parse", "HEAD"], cwd=LEROBOT, capture=True).stdout.strip()
     if actual != SOURCES["lerobot"]:
         raise ValueError("LeRobot checkout differs from sources.json; rerun setup with a clean checkout.")
+    runtime = json.loads((LEROBOT / "baseline-runtime.json").read_text())
+    if (runtime["name"] != args.env_name
+            or Path(runtime["prefix"]).resolve() != Path(sys.prefix).resolve()
+            or runtime["requirements_sha256"] != hashlib.sha256(REQUIREMENTS.read_bytes()).hexdigest()):
+        raise ValueError("Conda environment or dependency pins differ from setup; rerun setup with this --env-name.")
 
     if args.device == "mps" and not torch.backends.mps.is_available():
         raise ValueError("MPS unavailable. The original experiment used an Apple Silicon Mac.")
@@ -274,11 +330,12 @@ def run(args):
     directory.mkdir(parents=True)
     manifest = dict(sources=SOURCES, options={k: str(v) if isinstance(v, Path) else v
                                             for k, v in vars(args).items()}, argv=command,
-                    python=sys.version, platform=platform.platform())
+                    python=sys.version, platform=platform.platform(),
+                    conda_environment=args.env_name, conda_prefix=sys.prefix)
     manifest["packages"] = {k: importlib.metadata.version(k)
                             for k in ("lerobot", "torch", "transformers", "huggingface-hub")}
     manifest["files"] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
-                         for p in [*HERE.glob("*.py"), MODEL / "config.json",
+                         for p in [*HERE.glob("*.py"), REQUIREMENTS, HERE / "sources.json", MODEL / "config.json",
                                    MODEL / "policy_preprocessor.json", args.grasp]}
     manifest["git_commit"] = shell(["git", "rev-parse", "HEAD"], capture=True).stdout.strip()
     manifest["git_dirty"] = bool(shell(["git", "status", "--porcelain"], capture=True).stdout)
@@ -288,6 +345,8 @@ def run(args):
     shutil.copy2(MODEL / "policy_preprocessor.json", directory / "policy_preprocessor.json")
     shutil.copytree(HERE, directory / "source", ignore=shutil.ignore_patterns("__pycache__", "assets", "tests"))
     shutil.copy2(LEROBOT / "baseline-environment.txt", directory / "environment.txt")
+    shutil.copy2(LEROBOT / "baseline-environment.yml", directory / "environment.yml")
+    shutil.copy2(LEROBOT / "baseline-conda-explicit.txt", directory / "conda-explicit.txt")
     restore = install(InteractiveSession, args, directory)
     previous = sys.argv
     try:
@@ -304,10 +363,11 @@ def wizard(args):
         raise ValueError("The original MPS experiment needs an Apple Silicon Mac. "
                          "This host cannot run that backend. See baseline/README.md; "
                          "CUDA/CPU adaptations require an explicit --device selection.")
-    if not PYTHON.exists():
+    runtime_file = LEROBOT / "baseline-runtime.json"
+    if not runtime_file.exists() or json.loads(runtime_file.read_text())["name"] != args.env_name:
         print("Step 1: install the pinned environment (model weights are downloaded separately).")
-        setup()
-    managed_environment()
+        setup(env_name=args.env_name)
+    managed_environment(args.env_name)
     print("Original experiment: Apple Silicon/MPS, calibrated SO-101, top + wrist cameras.")
     args.port = input("Follower serial port: ").strip()
     args.id = input(f"Robot calibration ID [{args.id}]: ").strip() or args.id
@@ -347,6 +407,7 @@ def parser():
     ap.add_argument("command", nargs="?", default="wizard",
                     choices=("wizard", "setup", "prepare", "calibrate", "cameras", "teach", "replay", "check", "run"))
     ap.add_argument("--port")
+    ap.add_argument("--env-name", default="lerobot", help="Conda environment name (default: lerobot)")
     ap.add_argument("--id", default="my_awesome_follower_arm")
     ap.add_argument("--task", default="Pick up the white block.")
     ap.add_argument("--device", choices=("mps", "cuda", "cpu"), default="mps")
@@ -369,6 +430,9 @@ def main():
     ap = parser()
     args = ap.parse_args()
     args.grasp = args.grasp.resolve()
+    if args.env_name == "base" or not args.env_name or any(
+            not (c.isalnum() or c in "-_") for c in args.env_name):
+        ap.error("--env-name must be a named Conda environment using letters, digits, '-' or '_'; not base")
     if args.top == args.wrist:
         ap.error("--top and --wrist must differ")
     if args.command in ("check", "run", "teach", "calibrate") and not args.port:
@@ -377,14 +441,14 @@ def main():
         ap.error("--dry-run is supported for setup and run; replay is dry by default")
     try:
         if args.command == "setup":
-            setup(args.dry_run)
+            setup(args.dry_run, args.env_name)
         elif args.command == "wizard":
             wizard(args)
         elif args.command == "run" and args.dry_run:
             run(args)
         else:
             if args.command != "replay" or args.execute:
-                managed_environment()
+                managed_environment(args.env_name)
             if args.command in ("teach", "replay"):
                 from waypoints import teach, replay
                 args.file = args.grasp
