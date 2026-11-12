@@ -1,0 +1,9 @@
+{
+  "lerobot": "e595b7902714ba51f91e47523f66f89c5181b649",
+  "uv": "0.13.8",
+  "python": "3.12.12",
+  "models": {
+    "allenai/MolmoAct2-SO100_101": "152569fe57914d97be91055800035f54e250d009",
+    "lerobot/MolmoAct2-SO100_101-LeRobot": "a4ab68081b84bb0659d96f454edbce6abbe8a1cd"
+  }
+}

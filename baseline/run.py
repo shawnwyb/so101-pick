@@ -1,0 +1,404 @@
+"""Guided setup and single entry point for the original MolmoAct-2 pick experiment."""
+import argparse
+import hashlib
+import importlib.metadata
+import json
+import os
+import platform
+import shlex
+import shutil
+import subprocess
+import sys
+import venv
+from datetime import datetime
+from pathlib import Path
+
+from waypoints import commit_sequence, positive, nonnegative
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+SOURCES = json.loads((HERE / "sources.json").read_text())
+LEROBOT = ROOT / "lerobot"
+PYTHON = LEROBOT / ".venv/bin/python"
+TOOLS = ROOT / ".cache/baseline-tools"
+UV = TOOLS / "bin/uv"
+BASE = ROOT / "models/molmoact2-upstream"
+MODEL = ROOT / "models/molmoact2-mps"
+GRASP = ROOT / "outputs/waypoints/grasp.json"
+
+
+def shell(command, cwd=ROOT, capture=False):
+    print("+ " + shlex.join(map(str, command)), flush=True)
+    return subprocess.run(list(map(str, command)), cwd=cwd, check=True,
+                          text=True, capture_output=capture)
+
+
+def setup(dry_run=False):
+    """Install into an isolated, pinned checkout; leave existing environments alone."""
+    commands = [
+        [TOOLS / "bin/python", "-m", "pip", "install", f"uv=={SOURCES['uv']}"],
+        ["git", "init", LEROBOT],
+        ["git", "-C", LEROBOT, "remote", "add", "origin", "https://github.com/huggingface/lerobot.git"],
+        ["git", "-C", LEROBOT, "fetch", "--depth=1", "origin", SOURCES["lerobot"]],
+        ["git", "-C", LEROBOT, "checkout", "--detach", "FETCH_HEAD"],
+    ]
+    sync = [UV, "sync", "--locked", "--no-default-groups", "--python", SOURCES["python"],
+            "--extra", "molmoact2", "--extra", "feetech", "--extra", "core_scripts"]
+    if dry_run:
+        print(f"Create bootstrap venv: {TOOLS}")
+        for command in commands:
+            print(shlex.join(map(str, command)))
+        print("Apply baseline/patches/lerobot-mps-loader.patch if not already applied")
+        print(shlex.join(map(str, sync)) + f"  # cwd={LEROBOT}")
+        return
+    if not shutil.which("git") or not shutil.which("ffmpeg"):
+        raise ValueError("Install Git and FFmpeg first (macOS: brew install git ffmpeg), then retry.")
+    if not UV.exists():
+        venv.EnvBuilder(with_pip=True).create(TOOLS)
+        shell(commands[0])
+    if not LEROBOT.exists():
+        for command in commands[1:]:
+            shell(command)
+    actual = shell(["git", "rev-parse", "HEAD"], cwd=LEROBOT, capture=True).stdout.strip()
+    if actual != SOURCES["lerobot"]:
+        raise ValueError(f"Existing {LEROBOT} is at {actual}. Move it aside; setup will not overwrite it.")
+    patch = HERE / "patches/lerobot-mps-loader.patch"
+    reverse = subprocess.run(["git", "apply", "--reverse", "--check", str(patch)],
+                             cwd=LEROBOT, capture_output=True)
+    if reverse.returncode:
+        shell(["git", "apply", "--check", patch], cwd=LEROBOT)
+        shell(["git", "apply", patch], cwd=LEROBOT)
+    shell(sync, cwd=LEROBOT)
+    freeze = shell([UV, "pip", "freeze", "--python", PYTHON], capture=True).stdout
+    (LEROBOT / "baseline-environment.txt").write_text(freeze)
+    print("Setup complete. Python and dependencies are isolated under lerobot/.")
+
+
+def managed_environment():
+    if not PYTHON.exists():
+        raise ValueError("Run `python3 baseline/run.py setup` first, or run without arguments for the guide.")
+    # Do not resolve symlinks: venv Python may point to the same base interpreter.
+    if Path(sys.prefix) != PYTHON.parent.parent:
+        os.execv(str(PYTHON), [str(PYTHON), str(HERE / "run.py"), *sys.argv[1:]])
+
+
+def migrate(config, device="mps", dtype="bfloat16"):
+    config = dict(config)
+    if config.pop("enable_lora_action_expert", False):
+        raise ValueError("Action-expert LoRA requires a separate migration")
+    lora = config.pop("enable_lora_vlm", False)
+    frozen = config.pop("train_action_expert_only", False)
+    config["train_mode_vlm"] = "lora" if lora else ("freeze" if frozen else "fft")
+    config.pop("model_dtype", None)
+    config.update(device=device, dtype=dtype, checkpoint_path=str(BASE),
+                  enable_inference_cuda_graph=False, compile_model=False)
+    return config
+
+
+def prepare(args):
+    from huggingface_hub import snapshot_download
+    import draccus
+    from lerobot.policies.molmoact2.configuration_molmoact2 import MolmoAct2Config
+
+    for repo, directory in (("allenai/MolmoAct2-SO100_101", BASE),
+                            ("lerobot/MolmoAct2-SO100_101-LeRobot", MODEL)):
+        snapshot_download(repo, revision=SOURCES["models"][repo], local_dir=directory,
+                          allow_patterns=["*.json", "*.safetensors", "*.jinja", "assets/*.png"],
+                          max_workers=4)
+    path = MODEL / "config.json"
+    backup = MODEL / "config.original.json"
+    if not backup.exists():
+        backup.write_text(path.read_text())
+    config = migrate(json.loads(backup.read_text()), args.device, args.dtype)
+    draccus.decode(MolmoAct2Config, {k: v for k, v in config.items() if k != "type"})
+    processor_path = MODEL / "policy_preprocessor.json"
+    processor = json.loads(processor_path.read_text())
+    for step in processor["steps"]:
+        if step["registry_name"] == "molmoact2_pack_inputs":
+            step["config"]["checkpoint_path"] = str(BASE)
+        elif step["registry_name"] == "device_processor":
+            step["config"]["device"] = args.device
+    path.write_text(json.dumps(config, indent=2) + "\n")
+    processor_path.write_text(json.dumps(processor, indent=2) + "\n")
+    (MODEL / "source_revisions.json").write_text(json.dumps(SOURCES, indent=2) + "\n")
+    print(f"Prepared {MODEL}; the saved processors retain the joint-frame correction.")
+
+
+def cameras(args):
+    import cv2
+    import threading
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    captures = []
+    frames, errors = {}, []
+    stop = threading.Event()
+    server = worker = None
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            key = self.path.split("?")[0].lstrip("/")
+            if key in ("cam0", "cam1"):
+                content, kind = frames.get(key, b""), "image/jpeg"
+            elif not key:
+                content = (b"<!doctype html><title>SO-101 camera check</title>"
+                           b"<h2>cam0: top</h2><img id=cam0><h2>cam1: wrist</h2><img id=cam1>"
+                           b"<script>setInterval(()=>{for(const k of ['cam0','cam1'])"
+                           b"document.getElementById(k).src='/'+k+'?t='+Date.now()},300)</script>")
+                kind = "text/html"
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(content)
+
+        def log_message(self, *args):
+            pass
+
+    def capture():
+        try:
+            while not stop.is_set():
+                for cap, key in captures:
+                    ok, frame = cap.read()
+                    if not ok:
+                        raise ValueError(f"Lost camera stream: {key}")
+                    ok, encoded = cv2.imencode(".jpg", frame)
+                    if not ok:
+                        raise ValueError(f"Cannot encode camera: {key}")
+                    frames[key] = encoded.tobytes()
+        except Exception as exc:
+            errors.append(exc)
+            print(f"Camera error: {exc}. Press Enter to close preview.", flush=True)
+
+    try:
+        for index, label in ((args.top, "cam0"), (args.wrist, "cam1")):
+            cap = cv2.VideoCapture(index)
+            captures.append((cap, label))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            if not cap.isOpened():
+                raise ValueError(f"Cannot open {label} at index {index}")
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        worker = threading.Thread(target=capture, daemon=True)
+        worker.start()
+        url = f"http://127.0.0.1:{server.server_port}"
+        print(f"Camera check: {url} (cam0 top, cam1 wrist).", flush=True)
+        webbrowser.open(url)
+        input("Verify both views in your browser, then press Enter here to close preview: ")
+        if errors:
+            raise errors[0]
+    finally:
+        stop.set()
+        if server:
+            server.shutdown()
+            server.server_close()
+        if worker:
+            worker.join(timeout=3)
+        for cap, _ in captures:
+            cap.release()
+
+
+def rollout_args(args):
+    cameras_config = {key: dict(type="opencv", index_or_path=index, width=640, height=480, fps=30)
+                      for key, index in (("cam0", args.top), ("cam1", args.wrist))}
+    inference = (["--inference.type=rtc", "--inference.rtc.enabled=false", "--inference.queue_threshold=30"]
+                 if args.mode == "prefetch" else ["--inference.type=sync"])
+    return ["--strategy.type=base", *inference,
+            f"--policy.path={MODEL}", "--policy.inference_action_mode=continuous",
+            f"--policy.device={args.device}", f"--policy.dtype={args.dtype}",
+            "--policy.enable_inference_cuda_graph=false",
+            f"--policy.n_action_steps={8 if args.mode == 'replan' else 30}",
+            "--robot.type=so101_follower", f"--robot.port={args.port}", f"--robot.id={args.id}",
+            "--robot.use_degrees=true", "--robot.max_relative_target=10",
+            f"--robot.cameras={json.dumps(cameras_config)}", "--fps=30", f"--task={args.task}",
+            f"--duration={args.duration}", "--interactive=true",
+            "--return_to_initial_position=false", "--play_sounds=false"]
+
+
+def check(args):
+    import torch
+    from lerobot.rollout.interactive import InteractiveSession
+    from lerobot.scripts.lerobot_rollout import main as rollout_main
+    from waypoints import load
+
+    actual = shell(["git", "rev-parse", "HEAD"], cwd=LEROBOT, capture=True).stdout.strip()
+    if actual != SOURCES["lerobot"]:
+        raise ValueError("LeRobot checkout differs from sources.json; rerun setup with a clean checkout.")
+
+    if args.device == "mps" and not torch.backends.mps.is_available():
+        raise ValueError("MPS unavailable. The original experiment used an Apple Silicon Mac.")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA unavailable")
+    if not Path(args.port).exists():
+        raise ValueError(f"Arm port does not exist: {args.port}")
+    for directory in (MODEL, BASE):
+        if not (directory / "config.json").exists() or not list(directory.glob("*.safetensors")):
+            raise ValueError(f"Incomplete checkpoint {directory}; run `prepare`.")
+    if json.loads((MODEL / "source_revisions.json").read_text()) != SOURCES:
+        raise ValueError("Checkpoint pins differ; run `prepare`.")
+    config = json.loads((MODEL / "config.json").read_text())
+    if config["device"] != args.device or config["dtype"] != args.dtype:
+        raise ValueError("Device/dtype differ from prepared checkpoint; rerun `prepare` with these options.")
+    payload = load(args.grasp)
+    if payload.get("id") != args.id:
+        raise ValueError("Waypoint robot ID differs. Re-teach for this calibrated arm.")
+    commit_sequence(args.grasp, args.closed_gripper)
+    from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, ROBOTS
+    from lerobot.robots.so_follower import SO101Follower
+    calibration = HF_LEROBOT_CALIBRATION / ROBOTS / SO101Follower.name / f"{args.id}.json"
+    if not calibration.is_file():
+        raise ValueError(f"Missing calibration {calibration}; run the calibrate command first.")
+    if not callable(rollout_main) or not hasattr(InteractiveSession, "run"):
+        raise ValueError("Incompatible LeRobot rollout API")
+    print("Preflight passed. No robot connection or camera capture was opened.")
+    print("Calibration file exists; live calibration consistency and model inference are checked on launch.")
+
+
+def run(args):
+    command = rollout_args(args)
+    print("LeRobot options: " + shlex.join(command), flush=True)
+    if args.dry_run:
+        print("Dry run: setup, downloads, model loading, and hardware connection skipped.")
+        return
+    check(args)
+    from lerobot.rollout.interactive import InteractiveSession
+    from lerobot.scripts.lerobot_rollout import main as rollout_main
+    from session import install
+
+    directory = ROOT / "outputs/runs" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    directory.mkdir(parents=True)
+    manifest = dict(sources=SOURCES, options={k: str(v) if isinstance(v, Path) else v
+                                            for k, v in vars(args).items()}, argv=command,
+                    python=sys.version, platform=platform.platform())
+    manifest["packages"] = {k: importlib.metadata.version(k)
+                            for k in ("lerobot", "torch", "transformers", "huggingface-hub")}
+    manifest["files"] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                         for p in [*HERE.glob("*.py"), MODEL / "config.json",
+                                   MODEL / "policy_preprocessor.json", args.grasp]}
+    manifest["git_commit"] = shell(["git", "rev-parse", "HEAD"], capture=True).stdout.strip()
+    manifest["git_dirty"] = bool(shell(["git", "status", "--porcelain"], capture=True).stdout)
+    (directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    shutil.copy2(args.grasp, directory / "grasp.json")
+    shutil.copy2(MODEL / "config.json", directory / "model_config.json")
+    shutil.copy2(MODEL / "policy_preprocessor.json", directory / "policy_preprocessor.json")
+    shutil.copytree(HERE, directory / "source", ignore=shutil.ignore_patterns("__pycache__", "assets", "tests"))
+    shutil.copy2(LEROBOT / "baseline-environment.txt", directory / "environment.txt")
+    restore = install(InteractiveSession, args, directory)
+    previous = sys.argv
+    try:
+        sys.argv = ["lerobot_rollout", *command]
+        print(f"Run evidence: {directory}\n/commit, /commitandrecord, /reset, /start, /subtask, /stop", flush=True)
+        rollout_main()
+    finally:
+        sys.argv = previous
+        restore()
+
+
+def wizard(args):
+    if args.device == "mps" and (sys.platform != "darwin" or platform.machine() != "arm64"):
+        raise ValueError("The original MPS experiment needs an Apple Silicon Mac. "
+                         "This host cannot run that backend. See baseline/README.md; "
+                         "CUDA/CPU adaptations require an explicit --device selection.")
+    if not PYTHON.exists():
+        print("Step 1: install the pinned environment (model weights are downloaded separately).")
+        setup()
+    managed_environment()
+    print("Original experiment: Apple Silicon/MPS, calibrated SO-101, top + wrist cameras.")
+    args.port = input("Follower serial port: ").strip()
+    args.id = input(f"Robot calibration ID [{args.id}]: ").strip() or args.id
+    args.task = input(f"Task [{args.task}]: ").strip() or args.task
+    args.top = int(input("Top camera index [0]: ").strip() or "0")
+    args.wrist = int(input("Wrist camera index [1]: ").strip() or "1")
+    if args.top == args.wrist:
+        raise ValueError("Camera indices must differ")
+    if input("Is this arm already calibrated under that ID? [y/N]: ").lower() != "y":
+        calibrate(args)
+    print("Step 2: download pinned model weights and prepare the MPS checkpoint.")
+    prepare(args)
+    print("Step 3: verify camera assignment in the browser, then Enter to finish.")
+    cameras(args)
+    print("Step 4: support the arm; teaching disables torque. Stop other robot programs.")
+    if args.grasp.exists():
+        answer = input(f"Reuse {args.grasp} with the same arm/base/object placement? [y/N]: ").lower()
+        if answer != "y":
+            raise ValueError("Choose a new --grasp path and rerun to teach without overwriting existing poses.")
+    else:
+        from waypoints import teach
+        args.file, args.names = args.grasp, ["approach", "lower", "close", "lift"]
+        teach(args)
+    check(args)
+    print("Step 5: model rollout plus taught grasp. Disconnect releases torque; support the arm.")
+    if input("Ready to connect and enter the interactive session? [y/N]: ").lower() == "y":
+        run(args)
+
+
+def calibrate(args):
+    shell([sys.executable, "-m", "lerobot.scripts.lerobot_calibrate",
+           "--robot.type=so101_follower", f"--robot.port={args.port}", f"--robot.id={args.id}"])
+
+
+def parser():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("command", nargs="?", default="wizard",
+                    choices=("wizard", "setup", "prepare", "calibrate", "cameras", "teach", "replay", "check", "run"))
+    ap.add_argument("--port")
+    ap.add_argument("--id", default="my_awesome_follower_arm")
+    ap.add_argument("--task", default="Pick up the white block.")
+    ap.add_argument("--device", choices=("mps", "cuda", "cpu"), default="mps")
+    ap.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
+    ap.add_argument("--top", type=int, default=0)
+    ap.add_argument("--wrist", type=int, default=1)
+    ap.add_argument("--mode", choices=("sync", "prefetch", "replan"), default="sync")
+    ap.add_argument("--duration", type=positive, default=30)
+    ap.add_argument("--coarse-seconds", type=positive, default=15)
+    ap.add_argument("--closed-gripper", type=nonnegative, default=0)
+    ap.add_argument("--dive-step", type=positive, default=0.4)
+    ap.add_argument("--dive-fps", type=positive, default=15)
+    ap.add_argument("--grasp", type=Path, default=GRASP)
+    ap.add_argument("--dry-run", action="store_true", help="setup plan or rollout options; no changes or hardware")
+    ap.add_argument("--execute", action="store_true", help="execute waypoint replay (otherwise only validates)")
+    return ap
+
+
+def main():
+    ap = parser()
+    args = ap.parse_args()
+    args.grasp = args.grasp.resolve()
+    if args.top == args.wrist:
+        ap.error("--top and --wrist must differ")
+    if args.command in ("check", "run", "teach", "calibrate") and not args.port:
+        ap.error("--port is required for this command")
+    if args.dry_run and args.command not in ("setup", "run"):
+        ap.error("--dry-run is supported for setup and run; replay is dry by default")
+    try:
+        if args.command == "setup":
+            setup(args.dry_run)
+        elif args.command == "wizard":
+            wizard(args)
+        elif args.command == "run" and args.dry_run:
+            run(args)
+        else:
+            if args.command != "replay" or args.execute:
+                managed_environment()
+            if args.command in ("teach", "replay"):
+                from waypoints import teach, replay
+                args.file = args.grasp
+                args.names = ["approach", "lower", "close", "lift"]
+                args.step, args.fps, args.pause, args.hold = 0.4, 15, 1, 5
+                (teach if args.command == "teach" else replay)(args)
+            else:
+                {"prepare": prepare, "calibrate": calibrate, "cameras": cameras,
+                 "check": check, "run": run}[args.command](args)
+    except (ValueError, OSError, KeyError, ImportError, subprocess.CalledProcessError) as exc:
+        ap.exit(1, f"Error: {exc}\n")
+    except KeyboardInterrupt:
+        ap.exit(130, "Interrupted. Support the arm when torque releases.\n")
+
+
+if __name__ == "__main__":
+    main()
